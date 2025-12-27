@@ -1,0 +1,24 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Generated folders
+clean_html/
+logs/
+groq_cache/
+raw_html/
+extracted/
+
+# Generated outputs
+laptop_cms_template_*.csv
+
+# Secrets
+.env
+
+# Streamlit cache
+.streamlit/
+
+# OS
+.DS_Store
+Thumbs.db
