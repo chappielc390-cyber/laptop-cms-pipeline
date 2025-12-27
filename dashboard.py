@@ -7,6 +7,9 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+# =========================
+# PATHS (cloud + local safe)
+# =========================
 BASE_DIR = Path(__file__).parent.resolve()
 
 PIPELINE_SCRIPT = BASE_DIR / "one_run_laptop_pipeline.py"
@@ -28,9 +31,14 @@ st.set_page_config(page_title="Laptop CMS Pipeline Dashboard", layout="wide")
 # Playwright Chromium install (Cloud)
 # =========================
 def ensure_playwright_browser():
+    """
+    Streamlit Cloud does NOT install Chromium automatically.
+    This installs it once and marks completion.
+    """
     marker = BASE_DIR / ".pw_installed"
     if marker.exists():
         return
+
     with st.spinner("Installing Playwright Chromium (first run only)…"):
         try:
             subprocess.run(
@@ -71,7 +79,15 @@ def sku_status_table(df: pd.DataFrame):
         })
     return pd.DataFrame(rows)
 
-def run_pipeline():
+# =========================
+# Run pipeline IN-PROCESS (shows full traceback)
+# =========================
+def run_pipeline_inprocess():
+    import io
+    import runpy
+    import traceback
+    from contextlib import redirect_stdout, redirect_stderr
+
     if not os.getenv("GROQ_API_KEY"):
         st.error("GROQ_API_KEY not set. Add it in Streamlit Cloud → Settings → Secrets.")
         return
@@ -80,50 +96,31 @@ def run_pipeline():
         st.error(f"Pipeline script missing: {PIPELINE_SCRIPT}")
         return
 
-    st.info("Running pipeline… (live output below)")
+    st.info("Running pipeline inside Streamlit (this captures full errors)…")
 
-    proc = subprocess.Popen(
-        [sys.executable, str(PIPELINE_SCRIPT)],
-        cwd=str(BASE_DIR),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-    )
-
-    live = st.empty()
-    output_lines = []
-
-    while True:
-        line = proc.stdout.readline() if proc.stdout else ""
-        if line:
-            output_lines.append(line)
-            live.code("".join(output_lines[-300:]))
-        if proc.poll() is not None:
-            break
-        time.sleep(0.2)
+    buf = io.StringIO()
 
     try:
-        rest = proc.stdout.read() if proc.stdout else ""
-        if rest:
-            output_lines.append(rest)
-    except Exception:
-        pass
+        with redirect_stdout(buf), redirect_stderr(buf):
+            runpy.run_path(str(PIPELINE_SCRIPT), run_name="__main__")
 
-    output = "".join(output_lines)
-    rc = proc.returncode
-
-    if rc != 0 or "Traceback (most recent call last)" in output:
-        st.error(f"Pipeline failed ❌ (exit code {rc})")
-        st.code(output)
-    else:
         st.success("Pipeline finished successfully ✅")
-        st.code(output)
+        st.code(buf.getvalue()[-20000:])
+
+    except Exception:
+        st.error("Pipeline failed ❌ (full traceback below)")
+        full = buf.getvalue() + "\n\n" + traceback.format_exc()
+        st.code(full[-30000:])
 
 # =========================
 # UI
 # =========================
 st.title("Laptop CMS Pipeline Dashboard")
+
+# Debug info (very useful on Streamlit Cloud)
+st.caption(f"Python: {sys.version}")
+st.caption(f"Executable: {sys.executable}")
+st.caption(f"Base dir: {BASE_DIR}")
 
 st.subheader("Input file")
 upload = st.file_uploader("Upload input.xlsx", type=["xlsx"])
@@ -140,14 +137,13 @@ else:
 st.divider()
 
 if st.button("▶ Run pipeline"):
-    run_pipeline()
+    run_pipeline_inprocess()
 
 st.divider()
 
 st.subheader("Live log (pipeline)")
 st.code(tail_text(PIPELINE_LOG), language="text")
 
-# ✅ Fix 3: show startup crash log if exists
 if STARTUP_CRASH_LOG.exists():
     st.subheader("Startup crash log (pipeline)")
     st.code(tail_text(STARTUP_CRASH_LOG), language="text")
