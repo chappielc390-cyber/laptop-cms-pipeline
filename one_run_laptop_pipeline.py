@@ -19,7 +19,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 # =========================
 # CONFIG
 # =========================
-BASE_DIR = Path(r"C:\Users\youmg\Desktop\idea")
+BASE_DIR = Path(__file__).parent.resolve()
 INPUT_XLSX = BASE_DIR / "input.xlsx"
 
 HTML_DIR = BASE_DIR / "clean_html"

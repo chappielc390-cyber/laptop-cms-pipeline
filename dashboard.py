@@ -10,7 +10,7 @@ import streamlit as st
 # =========================
 # CONFIG (match your project)
 # =========================
-BASE_DIR = Path(r"C:\Users\youmg\Desktop\idea")
+BASE_DIR = Path(__file__).parent.resolve()
 PIPELINE_SCRIPT = BASE_DIR / "one_run_laptop_pipeline.py"
 
 INPUT_XLSX = BASE_DIR / "input.xlsx"
