@@ -1,20 +1,41 @@
-# one_run_laptop_pipeline.py  (Resume Mode Option 3)
-# input.xlsx -> scrape (cached) -> Groq (cached) -> laptop_cms_template_<timestamp>.csv
+# one_run_laptop_pipeline.py  (Resume Mode Option 3 + Startup Crash Logger)
 
-import csv
-import json
-import os
-import random
-import re
-import time
-from datetime import datetime
+# --- STARTUP CRASH LOGGER (Streamlit Cloud debugging) ---
+import traceback
 from pathlib import Path
-from urllib.parse import urlparse
 
-import pandas as pd
-import requests
-from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+try:
+    _BASE = Path(__file__).parent.resolve()
+    (_BASE / "logs").mkdir(exist_ok=True)
+except Exception:
+    _BASE = Path(".")
+
+def _write_startup_crash(_e: Exception):
+    try:
+        log_file = _BASE / "logs" / "startup_crash.log"
+        log_file.write_text(traceback.format_exc(), encoding="utf-8")
+    except Exception:
+        pass
+# --- END STARTUP CRASH LOGGER ---
+
+try:
+    import csv
+    import json
+    import os
+    import random
+    import re
+    import time
+    from datetime import datetime
+    from urllib.parse import urlparse
+
+    import pandas as pd
+    import requests
+    from bs4 import BeautifulSoup
+    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+except Exception as e:
+    _write_startup_crash(e)
+    raise
 
 # =========================
 # CONFIG
@@ -36,12 +57,21 @@ PIPELINE_LOG = LOG_DIR / "one_run_pipeline.log"
 
 NA = "#NA"
 
-# If True: will detect latest existing output CSV and skip writing SKUs already present there.
-# (Not required for option 3, but useful.)
+# Cloud-safe: Streamlit Cloud needs headless
+HEADLESS = True
+SLOW_MO = 0
+
+MAX_SCRAPE_ATTEMPTS = 3
+NAV_TIMEOUT_MS = 90000
+WAIT_AFTER_GOTO_MS = 2000
+
+SKIP_HTML_IF_EXISTS_OVER_BYTES = 50_000
+DELAY_RANGE = (3.0, 6.0)
+
 RESUME_FROM_OLD_CSV = True
 
 # =========================
-# EXACT CSV HEADERS (ORDER MATTERS)
+# EXACT CSV HEADERS
 # =========================
 HEADERS = [
     "sku", "base_code", "attributes__lulu_ean", "attributes__keywords", "attributes__shipping_weight",
@@ -61,32 +91,13 @@ HEADERS = [
 # GROQ CONFIG
 # =========================
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-if not GROQ_API_KEY:
-    raise SystemExit("Missing GROQ_API_KEY. Set it (setx GROQ_API_KEY \"...\") then reopen PowerShell.")
-
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 MODEL = "openai/gpt-oss-120b"
 
 # =========================
-# PLAYWRIGHT CONFIG
-# =========================
-HEADLESS = True
-SLOW_MO = 35
-
-MAX_SCRAPE_ATTEMPTS = 3
-NAV_TIMEOUT_MS = 90000
-WAIT_AFTER_GOTO_MS = 2500
-
-# If html already exists and is >= this size, we assume it's good and skip scraping
-SKIP_HTML_IF_EXISTS_OVER_BYTES = 50_000
-
-# human-ish delay between URLs
-DELAY_RANGE = (4.0, 7.0)
-
-# =========================
 # GROQ RATE LIMIT / RETRY
 # =========================
-MIN_DELAY_BETWEEN_CALLS = 3.5
+MIN_DELAY_BETWEEN_CALLS = 3.0
 MAX_GROQ_RETRIES = 6
 BACKOFF_BASE = 2.0
 BACKOFF_JITTER = (0.2, 0.8)
@@ -130,7 +141,6 @@ def normalize_to_headers(row: dict) -> dict:
 
 def latest_output_csv() -> Path | None:
     candidates = sorted(BASE_DIR.glob("laptop_cms_template_*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
-    # Exclude the one we are currently creating (may exist if rerun quickly)
     candidates = [c for c in candidates if c.name != OUT_CSV.name]
     return candidates[0] if candidates else None
 
@@ -139,8 +149,6 @@ def load_done_skus_from_csv(csv_path: Path) -> set[str]:
     try:
         with csv_path.open("r", encoding="utf-8", newline="") as f:
             reader = csv.DictReader(f)
-            if not reader.fieldnames:
-                return done
             for row in reader:
                 sku = (row.get("sku") or "").strip()
                 if sku:
@@ -168,26 +176,21 @@ def looks_blocked_visible_text(html: str) -> bool:
     ]
     if any(s in text for s in strong):
         return True
-
     if "captcha" in text and any(s in text for s in ["verify", "robot", "human", "unusual traffic"]):
         return True
-
     return False
 
 # =========================
-# PLAYWRIGHT: COOKIES + HUMAN ACTIONS
+# PLAYWRIGHT HELPERS
 # =========================
 def try_accept_cookies(page) -> bool:
     selectors = [
-        "#sp-cc-accept",  # Amazon
+        "#sp-cc-accept",
         "button:has-text('Accept')",
+        "button:has-text('Accept All')",
         "button:has-text('I Accept')",
         "button:has-text('Agree')",
-        "button:has-text('Accept All')",
         "button:has-text('Allow all')",
-        "[data-testid='cookie-accept']",
-        "[aria-label*='Accept']",
-        "[id*='accept'][role='button']",
     ]
     for sel in selectors:
         try:
@@ -197,16 +200,6 @@ def try_accept_cookies(page) -> bool:
         except Exception:
             pass
     return False
-
-def human_wiggle(page):
-    try:
-        page.mouse.move(random.randint(50, 800), random.randint(50, 600))
-        page.wait_for_timeout(random.randint(200, 600))
-        page.mouse.wheel(0, random.randint(500, 1200))
-        page.wait_for_timeout(random.randint(400, 900))
-        page.mouse.move(random.randint(50, 900), random.randint(50, 650))
-    except Exception:
-        pass
 
 def wait_for_important_content(page, url: str):
     try:
@@ -297,6 +290,9 @@ Output the JSON object only.
 """.strip()
 
 def call_groq_with_retries(prompt: str) -> dict:
+    if not GROQ_API_KEY:
+        raise RuntimeError("Missing GROQ_API_KEY env var (Streamlit Secrets / local environment).")
+
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json",
@@ -320,9 +316,6 @@ def call_groq_with_retries(prompt: str) -> dict:
             time.sleep(backoff)
             continue
 
-        if r.status_code == 413:
-            r.raise_for_status()
-
         r.raise_for_status()
 
         data = r.json()
@@ -335,7 +328,7 @@ def call_groq_with_retries(prompt: str) -> dict:
     raise RuntimeError("Max retries exceeded (rate limit / transient errors).")
 
 # =========================
-# SCRAPE (WITH CACHE)
+# CACHE HELPERS
 # =========================
 def read_cached_html_if_ok(sku: str) -> str | None:
     html_path = HTML_DIR / f"{sku}.html"
@@ -348,13 +341,11 @@ def read_cached_html_if_ok(sku: str) -> str | None:
     return None
 
 def scrape_html(page, sku: str, url: str) -> tuple[bool, str]:
-    # 1) Resume: use cached HTML if exists
     cached = read_cached_html_if_ok(sku)
     if cached:
         log(f"HTML_CACHE_HIT {sku} bytes={len(cached)}")
         return True, cached
 
-    # 2) Otherwise scrape
     out_file = HTML_DIR / f"{sku}.html"
     shot_file = LOG_DIR / f"{sku}.png"
 
@@ -370,22 +361,19 @@ def scrape_html(page, sku: str, url: str) -> tuple[bool, str]:
             if try_accept_cookies(page):
                 log("  cookies=accepted")
 
-            human_wiggle(page)
-
             if attempt < 3:
                 wait_for_important_content(page, url)
             else:
-                page.wait_for_timeout(1200)
+                page.wait_for_timeout(1000)
 
             html = page.content()
 
-            # save
             try:
                 page.screenshot(path=str(shot_file), full_page=True)
             except Exception:
                 pass
-            out_file.write_text(html, encoding="utf-8")
 
+            out_file.write_text(html, encoding="utf-8")
             log(f"SAVED {sku} bytes={out_file.stat().st_size} final_url={page.url} screenshot={shot_file.name}")
             return True, html
 
@@ -396,7 +384,6 @@ def scrape_html(page, sku: str, url: str) -> tuple[bool, str]:
             last_err = f"ERROR {e}"
             log(f"  WARN error: {e}")
 
-    # final fail: try save whatever is present
     try:
         html_fail = page.content()
         out_file.write_text(html_fail, encoding="utf-8")
@@ -405,9 +392,6 @@ def scrape_html(page, sku: str, url: str) -> tuple[bool, str]:
     log(f"SCRAPE_FAIL {sku} | {last_err}")
     return False, html_fail
 
-# =========================
-# GROQ CACHE (OPTION 3)
-# =========================
 def cache_path_for_sku(sku: str) -> Path:
     return CACHE_DIR / f"{sku}.json"
 
@@ -445,6 +429,10 @@ def make_na_row(input_row: dict) -> dict:
 # MAIN
 # =========================
 def main():
+    log("=== PIPELINE START ===")
+    if not INPUT_XLSX.exists():
+        raise FileNotFoundError(f"input.xlsx not found at: {INPUT_XLSX}")
+
     df = pd.read_excel(INPUT_XLSX)
 
     done_skus = set()
@@ -466,11 +454,7 @@ def main():
                 locale="en-US",
                 timezone_id="Asia/Kolkata",
                 viewport={"width": 1366, "height": 768},
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                extra_http_headers={
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Upgrade-Insecure-Requests": "1",
-                }
+                extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
             )
             page = context.new_page()
 
@@ -494,16 +478,13 @@ def main():
                     writer.writerow(make_na_row(input_row))
                     continue
 
-                # Optional: skip writing SKUs already in old CSV (true "resume output")
                 if RESUME_FROM_OLD_CSV and sku in done_skus:
                     log(f"ROW_SKIP already_in_old_csv sku={sku}")
                     continue
 
-                # 0) Groq cache hit? then just write row (no scrape / no groq)
                 cached_groq = read_cached_groq_json(sku)
                 if cached_groq:
                     final_row = normalize_to_headers(cached_groq)
-                    # enforce mappings
                     final_row["sku"] = sku
                     final_row["base_code"] = sku
                     final_row["attributes__lulu_ean"] = input_row["ean"] or NA
@@ -515,10 +496,9 @@ def main():
                         final_row["attributes__other_information"] = input_row["category"] or NA
 
                     writer.writerow(final_row)
-                    log(f"GROQ_CACHE_HIT sku={sku} -> wrote row (no scrape/no groq)")
+                    log(f"GROQ_CACHE_HIT sku={sku} -> wrote row")
                     continue
 
-                # 1) scrape html (or use HTML cache)
                 ok_scrape, html = scrape_html(page, sku, url)
                 if not ok_scrape or not html:
                     log(f"ROW_FAIL scrape sku={sku} -> NA row")
@@ -526,35 +506,20 @@ def main():
                     time.sleep(random.uniform(*DELAY_RANGE))
                     continue
 
-                # 2) block check
                 if looks_blocked_visible_text(html):
                     log(f"ROW_SKIP blocked_visible_text sku={sku} -> NA row")
                     writer.writerow(make_na_row(input_row))
                     time.sleep(random.uniform(*DELAY_RANGE))
                     continue
 
-                # 3) compact payload + Groq
                 try:
                     payload = html_to_compact_payload(html, max_visible_chars=18000)
                     prompt = build_prompt(input_row, payload)
+                    model_row = call_groq_with_retries(prompt)
 
-                    try:
-                        model_row = call_groq_with_retries(prompt)
-                    except requests.HTTPError as e:
-                        status = getattr(e.response, "status_code", None)
-                        if status == 413:
-                            log(f"413 payload_too_large sku={sku} retry_smaller")
-                            payload = html_to_compact_payload(html, max_visible_chars=9000)
-                            prompt = build_prompt(input_row, payload)
-                            model_row = call_groq_with_retries(prompt)
-                        else:
-                            raise
-
-                    # cache Groq output (OPTION 3)
                     write_cached_groq_json(sku, model_row)
 
                     final_row = normalize_to_headers(model_row)
-                    # enforce mappings
                     final_row["sku"] = sku
                     final_row["base_code"] = sku
                     final_row["attributes__lulu_ean"] = input_row["ean"] or NA
@@ -577,10 +542,16 @@ def main():
             context.close()
             browser.close()
 
-    print(f"\nDONE: {OUT_CSV}")
+    log("=== PIPELINE END ===")
+    print(f"DONE: {OUT_CSV}")
     print(f"LOG:  {PIPELINE_LOG}")
-    print(f"HTML:  {HTML_DIR}")
+    print(f"HTML: {HTML_DIR}")
     print(f"CACHE:{CACHE_DIR}")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        # write full traceback for Streamlit Cloud debugging
+        _write_startup_crash(e)
+        raise

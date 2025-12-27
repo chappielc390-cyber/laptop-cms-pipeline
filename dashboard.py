@@ -1,16 +1,12 @@
 import os
 import sys
 import time
-import glob
 import subprocess
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
-# =========================
-# BASE DIR (CLOUD + LOCAL SAFE)
-# =========================
 BASE_DIR = Path(__file__).parent.resolve()
 
 PIPELINE_SCRIPT = BASE_DIR / "one_run_laptop_pipeline.py"
@@ -20,25 +16,21 @@ LOG_DIR = BASE_DIR / "logs"
 CACHE_DIR = BASE_DIR / "groq_cache"
 
 PIPELINE_LOG = LOG_DIR / "one_run_pipeline.log"
+STARTUP_CRASH_LOG = LOG_DIR / "startup_crash.log"
 
 HTML_DIR.mkdir(exist_ok=True)
 LOG_DIR.mkdir(exist_ok=True)
 CACHE_DIR.mkdir(exist_ok=True)
 
-st.set_page_config(page_title="Laptop CMS Pipeline", layout="wide")
+st.set_page_config(page_title="Laptop CMS Pipeline Dashboard", layout="wide")
 
 # =========================
-# PLAYWRIGHT CLOUD FIX
+# Playwright Chromium install (Cloud)
 # =========================
 def ensure_playwright_browser():
-    """
-    Streamlit Cloud does NOT install Chromium automatically.
-    This installs it once and marks completion.
-    """
     marker = BASE_DIR / ".pw_installed"
     if marker.exists():
         return
-
     with st.spinner("Installing Playwright Chromium (first run only)…"):
         try:
             subprocess.run(
@@ -56,24 +48,16 @@ def ensure_playwright_browser():
 ensure_playwright_browser()
 
 # =========================
-# HELPERS
+# Helpers
 # =========================
 def latest_output_csv():
-    files = sorted(
-        BASE_DIR.glob("laptop_cms_template_*.csv"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
+    files = sorted(BASE_DIR.glob("laptop_cms_template_*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
     return files[0] if files else None
 
-def tail_text(path: Path, max_chars=12000):
+def tail_text(path: Path, max_chars=20000):
     if not path.exists():
         return ""
     return path.read_text(encoding="utf-8", errors="ignore")[-max_chars:]
-
-def open_folder(folder: Path):
-    if os.name == "nt" and folder.exists():
-        subprocess.Popen(["explorer", str(folder)])
 
 def sku_status_table(df: pd.DataFrame):
     rows = []
@@ -89,7 +73,7 @@ def sku_status_table(df: pd.DataFrame):
 
 def run_pipeline():
     if not os.getenv("GROQ_API_KEY"):
-        st.error("GROQ_API_KEY not set in Streamlit Secrets.")
+        st.error("GROQ_API_KEY not set. Add it in Streamlit Cloud → Settings → Secrets.")
         return
 
     if not PIPELINE_SCRIPT.exists():
@@ -110,18 +94,15 @@ def run_pipeline():
     live = st.empty()
     output_lines = []
 
-    # Stream live output
     while True:
         line = proc.stdout.readline() if proc.stdout else ""
         if line:
             output_lines.append(line)
-            # show last ~300 lines
             live.code("".join(output_lines[-300:]))
         if proc.poll() is not None:
             break
         time.sleep(0.2)
 
-    # IMPORTANT: read any remaining buffered output
     try:
         rest = proc.stdout.read() if proc.stdout else ""
         if rest:
@@ -132,7 +113,6 @@ def run_pipeline():
     output = "".join(output_lines)
     rc = proc.returncode
 
-    # Treat any traceback as failure even if rc is weird
     if rc != 0 or "Traceback (most recent call last)" in output:
         st.error(f"Pipeline failed ❌ (exit code {rc})")
         st.code(output)
@@ -164,8 +144,13 @@ if st.button("▶ Run pipeline"):
 
 st.divider()
 
-st.subheader("Live log")
-st.code(tail_text(PIPELINE_LOG))
+st.subheader("Live log (pipeline)")
+st.code(tail_text(PIPELINE_LOG), language="text")
+
+# ✅ Fix 3: show startup crash log if exists
+if STARTUP_CRASH_LOG.exists():
+    st.subheader("Startup crash log (pipeline)")
+    st.code(tail_text(STARTUP_CRASH_LOG), language="text")
 
 st.divider()
 
