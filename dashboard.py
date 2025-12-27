@@ -92,28 +92,44 @@ def run_pipeline():
         st.error("GROQ_API_KEY not set in Streamlit Secrets.")
         return
 
+    if not PIPELINE_SCRIPT.exists():
+        st.error(f"Pipeline script missing: {PIPELINE_SCRIPT}")
+        return
+
+    st.info("Running pipeline… (watch output below)")
+
+    # IMPORTANT: use the SAME python that Streamlit is using
     proc = subprocess.Popen(
-        ["python", str(PIPELINE_SCRIPT)],
+        [sys.executable, str(PIPELINE_SCRIPT)],
         cwd=str(BASE_DIR),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        bufsize=1,
     )
 
     live = st.empty()
-
     output = ""
+
     while True:
-        line = proc.stdout.readline()
+        line = proc.stdout.readline() if proc.stdout else ""
         if line:
             output += line
-            output = output[-12000:]
+            output = output[-20000:]  # keep last 20k chars
             live.code(output)
+
         if proc.poll() is not None:
             break
+
         time.sleep(0.2)
 
-    st.success("Pipeline finished")
+    rc = proc.returncode
+    if rc == 0:
+        st.success("Pipeline finished successfully ✅")
+    else:
+        st.error(f"Pipeline failed ❌ (exit code {rc})")
+        st.code(output)
+
 
 # =========================
 # UI
