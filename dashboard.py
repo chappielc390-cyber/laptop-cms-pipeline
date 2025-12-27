@@ -96,9 +96,8 @@ def run_pipeline():
         st.error(f"Pipeline script missing: {PIPELINE_SCRIPT}")
         return
 
-    st.info("Running pipeline… (watch output below)")
+    st.info("Running pipeline… (live output below)")
 
-    # IMPORTANT: use the SAME python that Streamlit is using
     proc = subprocess.Popen(
         [sys.executable, str(PIPELINE_SCRIPT)],
         cwd=str(BASE_DIR),
@@ -109,27 +108,37 @@ def run_pipeline():
     )
 
     live = st.empty()
-    output = ""
+    output_lines = []
 
+    # Stream live output
     while True:
         line = proc.stdout.readline() if proc.stdout else ""
         if line:
-            output += line
-            output = output[-20000:]  # keep last 20k chars
-            live.code(output)
-
+            output_lines.append(line)
+            # show last ~300 lines
+            live.code("".join(output_lines[-300:]))
         if proc.poll() is not None:
             break
-
         time.sleep(0.2)
 
+    # IMPORTANT: read any remaining buffered output
+    try:
+        rest = proc.stdout.read() if proc.stdout else ""
+        if rest:
+            output_lines.append(rest)
+    except Exception:
+        pass
+
+    output = "".join(output_lines)
     rc = proc.returncode
-    if rc == 0:
-        st.success("Pipeline finished successfully ✅")
-    else:
+
+    # Treat any traceback as failure even if rc is weird
+    if rc != 0 or "Traceback (most recent call last)" in output:
         st.error(f"Pipeline failed ❌ (exit code {rc})")
         st.code(output)
-
+    else:
+        st.success("Pipeline finished successfully ✅")
+        st.code(output)
 
 # =========================
 # UI

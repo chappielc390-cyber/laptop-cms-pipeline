@@ -70,7 +70,7 @@ MODEL = "openai/gpt-oss-120b"
 # =========================
 # PLAYWRIGHT CONFIG
 # =========================
-HEADLESS = False
+HEADLESS = True
 SLOW_MO = 35
 
 MAX_SCRAPE_ATTEMPTS = 3
